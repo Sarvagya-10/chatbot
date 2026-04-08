@@ -1,6 +1,6 @@
 langchain
 langchain-core
-langgraph
+langgraph==0.0.40
 langchain-groq
 python-dotenv
 streamlit
