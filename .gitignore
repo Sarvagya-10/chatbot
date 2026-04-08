@@ -1,2 +1,4 @@
 chatbot
 .env
+myenv
+__pycache__

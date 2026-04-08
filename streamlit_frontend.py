@@ -1,8 +1,11 @@
 import streamlit as st
 import uuid
-import time
-from langchain_core.messages import HumanMessage, AIMessage
-from langgraph_backend import chatbot
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langgraph_database_backend import (
+    chatbot,
+    retrieve_all_threads,
+    ingest_pdf
+)
 
 
 # ---------- Utility functions ----------
@@ -14,8 +17,8 @@ def add_thread(thread_id):
     if thread_id not in [t["id"] for t in st.session_state.chat_threads]:
         st.session_state.chat_threads.append({
             "id": thread_id,
-            "name": thread_id[:8],  # temporary name
-            "auto_named": False     # track if first message used
+            "name": thread_id[:8],
+            "auto_named": False
         })
 
 
@@ -37,7 +40,7 @@ def delete_thread(thread_id):
 def auto_rename_thread(thread_id, first_message):
     for t in st.session_state.chat_threads:
         if t["id"] == thread_id and not t["auto_named"]:
-            t["name"] = first_message[:40]  # truncate title
+            t["name"] = first_message[:40]
             t["auto_named"] = True
             break
 
@@ -55,55 +58,88 @@ if "message_history" not in st.session_state:
     st.session_state.message_history = []
 
 if "chat_threads" not in st.session_state:
-    st.session_state.chat_threads = []
+    st.session_state.chat_threads = retrieve_all_threads()
+    
+if "ingested_docs" not in st.session_state:
+    st.session_state.ingested_docs = {}
 
-add_thread(st.session_state.thread_id)
+existing_ids = {t["id"] for t in st.session_state.chat_threads}
+if st.session_state.thread_id not in existing_ids:
+    add_thread(st.session_state.thread_id)
 
 
-# ---------- Sidebar UI ----------
-st.sidebar.title("LangGraph Chatbot")
+# ---------- Sidebar ----------
+st.sidebar.title("BatuniGPT")
 
 if st.sidebar.button("New Chat"):
     reset_chat()
     st.rerun()
 
+thread_key = str(st.session_state.thread_id)
+thread_docs = st.session_state.ingested_docs.setdefault(thread_key, {})
+
+st.sidebar.subheader("Upload PDF")
+
+uploaded_pdf = st.sidebar.file_uploader(
+    "Upload a PDF for this chat",
+    type=["pdf"]
+)
+
+if uploaded_pdf:
+    if uploaded_pdf.name in thread_docs:
+        st.sidebar.info(f"{uploaded_pdf.name} already indexed.")
+    else:
+        with st.sidebar.status("Indexing PDF...", expanded=True) as status:
+            summary = ingest_pdf(
+                uploaded_pdf.getvalue(),
+                thread_id=thread_key,
+                filename=uploaded_pdf.name
+            )
+            thread_docs[uploaded_pdf.name] = summary
+            status.update(label="PDF indexed", state="complete", expanded=False)
+
 st.sidebar.header("My Conversations")
 
 for thread in st.session_state.chat_threads[::-1]:
     thread_id = thread["id"]
-
     col1, col2 = st.sidebar.columns([6, 1])
 
-    # ---------- Open thread ----------
     if col1.button(thread["name"], key=f"open_{thread_id}"):
         st.session_state.thread_id = thread_id
         messages = load_conversation(thread_id)
 
         temp_messages = []
         for msg in messages:
-            role = "user" if isinstance(msg, HumanMessage) else "assistant"
-            temp_messages.append({"role": role, "content": msg.content})
+            if isinstance(msg, HumanMessage):
+                role = "user"
+            else:
+                role = "assistant"
+
+            temp_messages.append({
+                "role": role,
+                "content": msg.content
+            })
 
         st.session_state.message_history = temp_messages
         st.rerun()
 
-    # ---------- Delete ----------
     if col2.button("🗑", key=f"del_{thread_id}"):
         delete_thread(thread_id)
         st.rerun()
 
 
-# ---------- Load previous messages ----------
+# ---------- Display Previous Messages ----------
 for message in st.session_state.message_history:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
 
-# ---------- User input ----------
+# ---------- User Input ----------
 user_input = st.chat_input("Type here...")
 
 if user_input:
-    # store user message
+
+    # Save user message
     st.session_state.message_history.append({
         "role": "user",
         "content": user_input
@@ -112,28 +148,46 @@ if user_input:
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # 🔥 AUTO-RENAME on first message only
     auto_rename_thread(st.session_state.thread_id, user_input)
 
-    # send ONLY new message to LangGraph
-    messages = [HumanMessage(content=user_input)]
-
-    response_container = st.empty()
     full_reply = ""
+    
+    with st.chat_message("assistant"):
+        status_container = st.empty()
+        def ai_stream():
+            for message_chunk, _ in chatbot.stream(
+                {"messages": [HumanMessage(content=user_input)]},
+                config={"configurable": {"thread_id": thread_key}},
+                stream_mode="messages"
+            ):
 
-    for chunk, metadata in chatbot.stream(
-        {"messages": messages},
-        config={"configurable": {"thread_id": st.session_state.thread_id}},
-        stream_mode="messages",
-    ):
-        if isinstance(chunk, AIMessage) and chunk.content:
-            for char in chunk.content:
-                full_reply += char
-                response_container.chat_message("assistant").markdown(full_reply)
-                time.sleep(0.001)
+                # Tool message
+                if isinstance(message_chunk, ToolMessage):
+                    tool_name = getattr(message_chunk, "name", "tool")
 
-    # save assistant reply
+                    if tool_name == "calculator":
+                        status_container.info("🧮 Calculating...")
+                    elif tool_name == "get_stock_price":
+                        status_container.info("📈 Fetching stock price...")
+                    elif tool_name == "search":
+                        status_container.info("🔍 Searching...")
+                    elif tool_name == "rag_tool":
+                        status_container.info("📄 Reading document...")
+                    else:
+                        status_container.info(f"⚙️ Running {tool_name}...")
+
+                # AI response streaming
+                if isinstance(message_chunk, AIMessage):
+                    yield message_chunk.content
+
+            status_container.empty()
+
+        full_reply = st.write_stream(ai_stream())
+    # Save assistant reply once
     st.session_state.message_history.append({
         "role": "assistant",
         "content": full_reply
     })
+
+
+print("successfully ran frontend")
